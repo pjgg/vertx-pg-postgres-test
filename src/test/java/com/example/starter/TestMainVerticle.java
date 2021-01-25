@@ -116,57 +116,35 @@ public class TestMainVerticle {
   @DisplayName("⏱ DB connections collisions")
   @Order(3)
   void checkCollisionsWithConnections() throws Throwable {
-    TestPgClient pgClient = TestPgClient.Builder.newInstance(postgres).withPoolSize(10).withIdle(60, TimeUnit.SECONDS)
+    TestPgClient pgClient = TestPgClient.Builder.newInstance(postgres).withPoolSize(10).withIdle(1, TimeUnit.SECONDS)
       .build();
     final int events = 250000;
     CountDownLatch done = new CountDownLatch(events);
 
     for (int i = 0; i < events; i++) {
       Observable.range(1, 3)
-        .concatMap(n -> pgClient.getPool().rxGetConnection()
+        .flatMap(n -> pgClient.getPool().rxGetConnection()
           .map(con -> con.closeHandler(v -> System.err.println("Connection closed")))
           .map(con -> con.exceptionHandler(e -> System.err.println("Connection exception: '" + e.getMessage() + "'")))
           .doOnError(er -> System.err.println("Error to connect: '" + er.getMessage() + "'"))
           .doAfterSuccess(SqlConnection::close)
           .flatMapObservable(con -> con
             .rxPrepare("SELECT CURRENT_TIMESTAMP")
-            .doOnError(error -> System.err.println("Error on query: '" + error.getMessage() + "'"))
+            .doOnError(error -> {
+              System.out.println(done.getCount());
+              System.err.println("Error on query: '" + error.getMessage() + "'");
+            })
 
             .flatMapPublisher(st -> st.createStream(20).toFlowable())
             .map(row -> {
               System.err.println("Result 1: " + row.get(OffsetDateTime.class, 0));
+              done.countDown();
               return row.get(OffsetDateTime.class, 0);
             })
 
             .toObservable()
           )).toList().toObservable().toList().subscribe(re -> System.out.println("Subscribe success"),
         er -> System.err.println("Subscribe error: " + er.getMessage()));
-    }
-
-    done.await(TIMEOUT_SEC, TimeUnit.SECONDS);
-    assertEquals(done.getCount(), 0, String.format("Missing %d events.", events - done.getCount()));
-  }
-
-  @Test
-  @DisplayName("⏱ DB connections collisions")
-  @Order(3)
-  void checkCollisions() throws Throwable {
-    TestPgClient pgClient = TestPgClient.Builder.newInstance(postgres).withPoolSize(10).withIdle(1, TimeUnit.SECONDS).build();
-    final int events = 250000;
-    CountDownLatch done = new CountDownLatch(events);
-
-    for(int i = 0; i< events; i++) {
-      pgClient.getPool().preparedQuery("SELECT CURRENT_TIMESTAMP").rxExecute()
-        .doOnError(error -> System.err.println("Error on query: '" + error.getMessage() + "'"))
-        .map(RowSet::iterator)
-        .map(iterator -> {
-          if(iterator.hasNext()){
-            Row row = iterator.next();
-            System.out.println("Result 1: " + row.getOffsetDateTime(0));
-            done.countDown();
-            return row.getOffsetDateTime(0);
-          }else return null;
-        }).toObservable().toList().subscribe(re -> System.out.println("Subscribe success"), er -> System.err.println("Subscribe error: " + er.getMessage()));
     }
 
     done.await(TIMEOUT_SEC, TimeUnit.SECONDS);
