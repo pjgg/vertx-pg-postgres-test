@@ -147,6 +147,32 @@ public class TestMainVerticle {
     assertEquals(done.getCount(), 0, String.format("Missing %d events.", events - done.getCount()));
   }
 
+  @Test
+  @DisplayName("⏱ DB connections collisions")
+  @Order(3)
+  void checkCollisions() throws Throwable {
+    TestPgClient pgClient = TestPgClient.Builder.newInstance(postgres).withPoolSize(10).withIdle(1, TimeUnit.SECONDS).build();
+    final int events = 250000;
+    CountDownLatch done = new CountDownLatch(events);
+
+    for(int i = 0; i< events; i++) {
+      pgClient.getPool().preparedQuery("SELECT CURRENT_TIMESTAMP").rxExecute()
+        .doOnError(error -> System.err.println("Error on query: '" + error.getMessage() + "'"))
+        .map(RowSet::iterator)
+        .map(iterator -> {
+          if(iterator.hasNext()){
+            Row row = iterator.next();
+            System.out.println("Result 1: " + row.getOffsetDateTime(0));
+            done.countDown();
+            return row.getOffsetDateTime(0);
+          }else return null;
+        }).toObservable().toList().subscribe(re -> System.out.println("Subscribe success"), er -> System.err.println("Subscribe error: " + er.getMessage()));
+    }
+
+    done.await(TIMEOUT_SEC, TimeUnit.SECONDS);
+    assertEquals(done.getCount(), 0, String.format("Missing %d events.", events - done.getCount()));
+  }
+
   private void checkDbPoolTurnover(TestPgClient pgClient, CountDownLatch done) throws InterruptedException {
     List<Completable> completed = new ArrayList<>();
 
