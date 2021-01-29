@@ -1,5 +1,6 @@
 package com.example.starter;
 
+import com.example.starter.resources.PostgresqlResources;
 import io.reactivex.Observable;
 import io.vertx.core.Handler;
 import io.vertx.pgclient.PgConnectOptions;
@@ -18,15 +19,16 @@ public class BadIdleConnectionTest extends AbstractVerticle {
   private PgPool client;
 
   public static void main(String[] args) {
+    PostgresqlResources postgres = new PostgresqlResources();
+    postgres.start();
+
     PgConnectOptions connectOptions = new PgConnectOptions()
-      .setHost("127.0.0.1")
-      .setPort(5432)
+      .setHost(postgres.pgHost())
+      .setPort(postgres.pgPort())
       .setDatabase("amadeus")
       .setUser("test")
       .setPassword("test")
       .setConnectTimeout(5000)
-//				.setReconnectAttempts(1)
-//				.setReconnectInterval(100)
       .setIdleTimeout(1000)
       .setIdleTimeoutUnit(TimeUnit.MILLISECONDS);
     Vertx vertx = Vertx.vertx();
@@ -46,10 +48,10 @@ public class BadIdleConnectionTest extends AbstractVerticle {
     AtomicInteger at = new AtomicInteger(0);
     Handler<Long> handler = l -> {
       System.out.println("Connection #" + at.incrementAndGet());
-      Observable.range(1, 3)
+      Observable.range(1, 10)
         .flatMap(n -> client.rxGetConnection()
           .map(con -> con.closeHandler(v -> System.out.println("Connection closed")))
-          .map(con -> con.exceptionHandler(e -> System.out.println("Connection exception: '" + e.getMessage() + "'")))
+          .map(con -> con.exceptionHandler(e -> System.err.println("Connection exception: '" + e.getMessage() + "'")))
           .doOnError(er -> System.out.println("Error to connect: '" + er.getMessage() + "'"))
           .doAfterSuccess(SqlConnection::close)
           .flatMapObservable(con -> con
