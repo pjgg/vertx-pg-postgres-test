@@ -15,6 +15,7 @@ public class TestPgClient {
   public TestPgClient(Builder builder){
     pool = PgPool.pool(builder.pgConnectOptions, builder.poolOptions);
     connectOptions = builder.pgConnectOptions;
+    connectOptions.setReconnectAttempts(3);
     poolOptions = builder.poolOptions;
   }
 

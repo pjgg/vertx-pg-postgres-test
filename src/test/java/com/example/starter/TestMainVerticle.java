@@ -8,6 +8,7 @@ import io.reactivex.SingleSource;
 import io.vertx.reactivex.sqlclient.Row;
 import io.vertx.reactivex.sqlclient.RowIterator;
 import io.vertx.reactivex.sqlclient.RowSet;
+import io.vertx.reactivex.sqlclient.SqlConnection;
 import io.vertx.reactivex.sqlclient.Tuple;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -23,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 public class TestMainVerticle {
+
   static final int TIMEOUT_SEC = 60;
   static PostgresqlResources postgres = new PostgresqlResources();
 
@@ -39,17 +41,18 @@ public class TestMainVerticle {
   @Test
   @Order(1)
   void checkIdle() throws InterruptedException {
-    int idle = 1;
-    TestPgClient pgClient = TestPgClient.Builder.newInstance(postgres).withPoolSize(1).withIdle(idle, TimeUnit.SECONDS).build();
+    int idle = 10;
+    TestPgClient pgClient = TestPgClient.Builder.newInstance(postgres).withPoolSize(1).withIdle(idle, TimeUnit.SECONDS)
+      .build();
     CountDownLatch done = new CountDownLatch(1);
-    activeConnections(pgClient).subscribe(activeCon-> {
+    activeConnections(pgClient).subscribe(activeCon -> {
       assertEquals(activeCon, 1, "postgres IDLE fail!.");
       done.countDown();
     });
 
-    TimeUnit.SECONDS.sleep(idle);
+    //TimeUnit.SECONDS.sleep(idle);
 
-    activeConnections(pgClient).subscribe(activeCon-> {
+    activeConnections(pgClient).subscribe(activeCon -> {
       assertEquals(activeCon, 1, "postgres IDLE fail!.");
       done.countDown();
     });
@@ -62,13 +65,83 @@ public class TestMainVerticle {
   @DisplayName("⏱ DB connections are re-used")
   @Order(2)
   void checkDbPoolTurnover() throws Throwable {
-    TestPgClient pgClient = TestPgClient.Builder.newInstance(postgres).withPoolSize(5).withIdle(3, TimeUnit.SECONDS).build();
+    TestPgClient pgClient = TestPgClient.Builder.newInstance(postgres).withPoolSize(5).withIdle(3, TimeUnit.SECONDS)
+      .build();
     final int events = 250000;
     CountDownLatch done = new CountDownLatch(events);
 
     createDefaultTable(pgClient)
       .concatWith(loadDefaultData(pgClient))
-      .subscribe(()->checkDbPoolTurnover(pgClient, done));
+      .subscribe(() -> checkDbPoolTurnover(pgClient, done));
+
+    done.await(TIMEOUT_SEC, TimeUnit.SECONDS);
+    assertEquals(done.getCount(), 0, String.format("Missing %d events.", events - done.getCount()));
+  }
+
+  @Test
+  @DisplayName("⏱ DB connections collisions")
+  @Order(3)
+  void checkCollisions() throws Throwable {
+    TestPgClient pgClient = TestPgClient.Builder.newInstance(postgres).withPoolSize(10).withIdle(120, TimeUnit.SECONDS)
+      .build();
+    final int events = 1000000;
+    CountDownLatch done = new CountDownLatch(events);
+    for (int i = 0; i < events; i++) {
+      Observable.range(1, 3)
+        .flatMap(n -> pgClient.getPool().preparedQuery("SELECT CURRENT_TIMESTAMP, " + done.getCount() + " as N").rxExecute()
+          .doOnError(error -> {
+            System.out.println("Error: " + done.getCount());
+            System.err.println("Error on query: '" + error.getMessage() + "'");
+          })
+          .map(RowSet::iterator)
+          .map(iterator -> {
+            if (iterator.hasNext()) {
+              Row row = iterator.next();
+              System.out.println(done.getCount());
+              System.out.println("Result 1: " + row.getOffsetDateTime(0));
+              done.countDown();
+              return row.getOffsetDateTime(0);
+            } else {
+              return null;
+            }
+          }).toObservable()).toList().subscribe(re -> System.out.println("Subscribe success"),
+        er -> System.err.println("Subscribe error: " + er.getMessage()));
+    }
+
+    done.await(TIMEOUT_SEC, TimeUnit.SECONDS);
+    assertEquals(done.getCount(), 0, String.format("Missing %d events.", events - done.getCount()));
+  }
+
+  @Test
+  @DisplayName("⏱ DB connections collisions")
+  @Order(3)
+  void checkCollisionsWithConnections() throws Throwable {
+    TestPgClient pgClient = TestPgClient.Builder.newInstance(postgres).withPoolSize(10).withIdle(60, TimeUnit.SECONDS)
+      .build();
+    final int events = 250000;
+    CountDownLatch done = new CountDownLatch(events);
+
+    for (int i = 0; i < events; i++) {
+      Observable.range(1, 3)
+        .concatMap(n -> pgClient.getPool().rxGetConnection()
+          .map(con -> con.closeHandler(v -> System.err.println("Connection closed")))
+          .map(con -> con.exceptionHandler(e -> System.err.println("Connection exception: '" + e.getMessage() + "'")))
+          .doOnError(er -> System.err.println("Error to connect: '" + er.getMessage() + "'"))
+          .doAfterSuccess(SqlConnection::close)
+          .flatMapObservable(con -> con
+            .rxPrepare("SELECT CURRENT_TIMESTAMP")
+            .doOnError(error -> System.err.println("Error on query: '" + error.getMessage() + "'"))
+
+            .flatMapPublisher(st -> st.createStream(20).toFlowable())
+            .map(row -> {
+              System.err.println("Result 1: " + row.get(OffsetDateTime.class, 0));
+              return row.get(OffsetDateTime.class, 0);
+            })
+
+            .toObservable()
+          )).toList().toObservable().toList().subscribe(re -> System.out.println("Subscribe success"),
+        er -> System.err.println("Subscribe error: " + er.getMessage()));
+    }
 
     done.await(TIMEOUT_SEC, TimeUnit.SECONDS);
     assertEquals(done.getCount(), 0, String.format("Missing %d events.", events - done.getCount()));
@@ -137,7 +210,7 @@ public class TestMainVerticle {
   private void checkDbPoolTurnover(TestPgClient pgClient, CountDownLatch done) throws InterruptedException {
     List<Completable> completed = new ArrayList<>();
 
-    for(int i = 0; i< done.getCount(); i++){
+    for (int i = 0; i < done.getCount(); i++) {
       Single<Boolean> connectionsReUsed = Airline.findAll(pgClient.getPool())
         .flatMapCompletable(resultSet -> Completable.complete())
         .andThen(activeConnections(pgClient))
@@ -158,7 +231,9 @@ public class TestMainVerticle {
   }
 
   private Single<Long> activeConnections(TestPgClient pgClient) {
-    return pgClient.getPool().preparedQuery("SELECT count(*) as active_con FROM pg_stat_activity where application_name = 'vertx-pg-client'").rxExecute()
+    return pgClient.getPool()
+      .preparedQuery("SELECT count(*) as active_con FROM pg_stat_activity where application_name = 'vertx-pg-client'")
+      .rxExecute()
       .map(RowSet::iterator)
       .map(iterator -> iterator.hasNext() ? iterator.next().getLong("active_con") : null);
   }
@@ -174,7 +249,7 @@ public class TestMainVerticle {
     };
   }
 
-  private Completable createDefaultTable(TestPgClient pgClient){
+  private Completable createDefaultTable(TestPgClient pgClient) {
     return pgClient.getPool().preparedQuery("CREATE TABLE airlines (\n" +
       "  id            SERIAL PRIMARY KEY,\n" +
       "  iata_code     VARCHAR(100) NOT NULL UNIQUE,\n" +
@@ -183,18 +258,19 @@ public class TestMainVerticle {
       ");").rxExecute().flatMapCompletable(RowSet -> Completable.complete());
   }
 
-  private Completable loadDefaultData(TestPgClient pgClient){
+  private Completable loadDefaultData(TestPgClient pgClient) {
 
     List<Tuple> batch = new ArrayList<>();
-    batch.add(Tuple.of("IB","Iberia",10));
-    batch.add(Tuple.of("BA","British Airways",15));
-    batch.add(Tuple.of("LH","Lufthansa",7));
-    batch.add(Tuple.of("FR","Ryanair",20));
-    batch.add(Tuple.of("VY","Vueling",10));
-    batch.add(Tuple.of("TK","Turkish Airlines", 5));
+    batch.add(Tuple.of("IB", "Iberia", 10));
+    batch.add(Tuple.of("BA", "British Airways", 15));
+    batch.add(Tuple.of("LH", "Lufthansa", 7));
+    batch.add(Tuple.of("FR", "Ryanair", 20));
+    batch.add(Tuple.of("VY", "Vueling", 10));
+    batch.add(Tuple.of("TK", "Turkish Airlines", 5));
 
     return pgClient.getPool()
-      .preparedQuery("INSERT INTO airlines (iata_code, name, infant_price) VALUES ($1, $2, $3)").rxExecuteBatch(batch).flatMapCompletable(res-> Completable.complete());
+      .preparedQuery("INSERT INTO airlines (iata_code, name, infant_price) VALUES ($1, $2, $3)").rxExecuteBatch(batch)
+      .flatMapCompletable(res -> Completable.complete());
   }
 
 }
